@@ -449,7 +449,7 @@ class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
             **args
         )
         
-        # 计算 logits（可选择只保留最后几个 token）
+        # 计算 logits（可选择只保留最后几个 token， 默认 logits_to_keep = 0 即全部 token 的输出都保留，即训练模式）
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         

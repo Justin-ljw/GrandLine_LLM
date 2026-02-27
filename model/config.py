@@ -42,7 +42,6 @@ class GrandLineConfig(PretrainedConfig):
         # 激活函数和正则化
         hidden_act: str = 'silu',
         dropout: float = 0.0,
-        weight_decay: float = 0.0,
         rms_norm_eps: float = 1e-05,
         
         # 特殊token
@@ -64,7 +63,6 @@ class GrandLineConfig(PretrainedConfig):
             self.rope_theta = rope_theta
             self.hidden_act = hidden_act
             self.dropout = dropout
-            self.weight_decay = weight_decay
             self.rms_norm_eps = rms_norm_eps
             self.bos_token_id = bos_token_id
             self.eos_token_id = eos_token_id
