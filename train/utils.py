@@ -37,6 +37,20 @@ def get_lr(lr, current_step, total_steps, warmup_steps=0):
         return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * progress)))
     
 
+def init_distributed_mode():
+    """
+    初始化分布式训练环境（多 GPU DDP）。
+    若未设置 RANK（如直接 python 跑单卡），则按单机模式处理并返回 0。
+    """
+    if int(os.environ.get("RANK", -1)) == -1:
+        return 0  # 非 DDP：单进程，使用默认设备（如 cuda:0）
+
+    dist.init_process_group(backend="nccl")  # NCCL 用于多 GPU 通信
+    local_rank = int(os.environ["LOCAL_RANK"])  # 当前进程在本机上的 GPU 编号
+    torch.cuda.set_device(local_rank)  # 绑定当前进程到对应 GPU
+    return local_rank
+
+
 class SkipBatchSampler(Sampler):
     '''
     自定义 BatchSampler，支持跳过前 skip 个样本，适用于训练恢复时的情况
