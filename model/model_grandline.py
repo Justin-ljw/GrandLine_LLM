@@ -320,7 +320,7 @@ class GrandLineBlock(nn.Module):
 
 class GrandLineModel(nn.Module):
     """
-    SpongeBob 模型主体（Decoder-only Transformer）
+    GrandLine 模型主体（Decoder-only Transformer）
     """
     def __init__(self, config: GrandLineConfig):
         super().__init__()
