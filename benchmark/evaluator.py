@@ -49,7 +49,7 @@ def eval_multiple_choice(model, tokenizer, context, choices, label_idx, max_leng
         shifted_labels = input_ids[..., 1:].contiguous()
         
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(shifted_logits.view(-1, shifted_logits.size(-1), shifted_labels.view(-1)))
+        loss = loss_fct(shifted_logits.view(-1, shifted_logits.size(-1)), shifted_labels.view(-1))
         
         # Choice 在 shift 后的起始位置应该是 context_len - 1
         # 因为 loss[i] 预测的是原始序列中位置 i+1 的 token
@@ -68,9 +68,8 @@ def eval_multiple_choice(model, tokenizer, context, choices, label_idx, max_leng
             
         losses.append(choice_loss)
         
-        # 选择 loss 最小的作为预测
-        pred_idx = losses.index(min(losses))
-        return 1 if pred_idx == label_idx else 0
+    pred_idx = losses.index(min(losses))
+    return 1 if pred_idx == label_idx else 0
 
 
 def eval_c3(model, tokenizer, data_path):
