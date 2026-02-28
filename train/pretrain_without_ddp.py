@@ -122,12 +122,12 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         if args.eval_bench == 1 and tokenizer is not None and (global_step % args.eval_interval == 0):
             model.eval()
             # benchmark 的数据路径
-            cs_path = ''
-            xcopa_path = ''
-            eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=cs_path, xcopa_path=xcopa_path)
+            c3_path = 'benchmark/clue_c3_eval_500.jsonl'
+            xcopa_path = 'benchmark/xcopa_zh_merged.jsonl'
+            eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
             
-            if swanlab_run:
-                swanlab_run.log(eval_results, step=global_step)
+            if swanlab:
+                swanlab.log(eval_results, step=global_step)
             Logger(f'Benchmark evaluated at step {global_step}: {eval_results}')
             
             model.train()
@@ -261,9 +261,9 @@ if __name__ == "__main__":
         Logger('Running initial benchmark evaluation (step 0)...')
         model.eval()
         # benchmark 的数据路径
-        cs_path = ''
-        xcopa_path = ''
-        eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=cs_path, xcopa_path=xcopa_path)
+        c3_path = 'benchmark/clue_c3_eval_500.jsonl'
+        xcopa_path = 'benchmark/xcopa_zh_merged.jsonl'
+        eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
         
         if swanlab_run:
             swanlab_run.log(eval_results, step=0)
