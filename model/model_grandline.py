@@ -231,7 +231,7 @@ class Attention(nn.Module):
                 # atention_mask 的shape本来为(batch_size, k_len)，且用0/1标识是否为 padding token，0为 padding token
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, k_len)，插入两维度方便后续广播
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9  # 将 1/0 转换为 0/-inf
-                scores += extended_attention_mask
+                scores = scores + extended_attention_mask
                 
             attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
             attn_weights = self.attn_dropout(attn_weights)
@@ -310,10 +310,10 @@ class GrandLineBlock(nn.Module):
                                               past_key_value, 
                                               use_cache, 
                                               attention_mask)
-        x += residual
+        x = x + residual
         
         # FeedForward 部分
-        x += self.feed_forward(self.post_attn_rms_norm(x))
+        x = x + self.feed_forward(self.post_attn_rms_norm(x))
          
         return x, presnet_key_value
 
