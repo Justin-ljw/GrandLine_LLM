@@ -27,6 +27,8 @@ from model.model_grandline import GrandLineForCausalLM
 from utils import Logger, get_lr, SkipBatchSampler
 from benchmark.evaluator import run_benchmark
 
+_BENCH_PRETRAIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmark")
+
 warnings.filterwarnings('ignore')
 
 
@@ -78,9 +80,9 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
             scaler.step(optimizer)
             # 自适应调节缩放系数
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-        global_step = current_step 
+        global_step = epoch * iters + step
         
         # 定期打印日志
         if step % args.log_interval == 0 or step == iters - 1:
@@ -106,24 +108,24 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
             torch.save(state_dict, f'{ckp_dir}/{args.save_weight}_{lm_config.hidden_size}.pth')
             # 同时保存一个 resume.pth，方便后续断点续训时自动加载
             torch.save({
-                'model': state_dict, 
+                'model': state_dict,
                 'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(), 
-                'epoch': epoch, 
+                'scaler': scaler.state_dict(),
+                'epoch': epoch,
                 'step': step,
-                'global_step': global_step, 
+                'global_step': global_step,
                 'swanlab_id': getattr(swanlab, 'id', None) if swanlab else None
-            },f'{ckp_dir}/resume.pth')
+            }, f'{ckp_dir}/resume.pth')
             
             Logger(f'Checkpoint saved at step {global_step} to {ckp_dir}')
             model.train()
-            
+
         # Benchmark 评测
         if args.eval_bench == 1 and tokenizer is not None and (global_step % args.eval_interval == 0):
             model.eval()
             # benchmark 的数据路径
-            c3_path = 'benchmark/clue_c3_eval_500.jsonl'
-            xcopa_path = 'benchmark/xcopa_zh_merged.jsonl'
+            c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
+            xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
             eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
             
             if swanlab:
@@ -131,14 +133,14 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
             Logger(f'Benchmark evaluated at step {global_step}: {eval_results}')
             
             model.train()
-        
+
         # 清理本 epoch 的变量，释放显存
         del input_ids, labels, res, loss
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GrandLine Pretraining (Single GPU)")
-    parser.add_argument("--save_dir", type=str, default="../pretrain_out", help="模型保存根目录")
+    parser.add_argument("--save_dir", type=str, default="../model_weight/pretrain/exp_single_1", help="模型保存根目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
@@ -150,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    parser.add_argument("--save_interval", type=int, default=3000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
@@ -161,11 +163,12 @@ if __name__ == "__main__":
     parser.add_argument("--swanlab_project", type=str, default="GrandLine-Pretrain", help="swanlab项目名")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
-    parser.add_argument("--eval_interval", type=int, default=100, help="评测间隔步数")
+    parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
     args = parser.parse_args()
     
     
     # ========== 1. 配置目录、检查 checkpoint ==========
+    # 生成 run_name（用于后续创建子目录）
     run_name = f"h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
@@ -194,7 +197,7 @@ if __name__ == "__main__":
         swanlab.login(api_key='')
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
         swanlab_run = swanlab.init(
-            project=args.swanlab_project, 
+            project=args.swanlab_project,
             experiment_name=run_name,
             id=swanlab_id,
             config=vars(args)
@@ -211,7 +214,7 @@ if __name__ == "__main__":
     else:
         Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
         model = GrandLineForCausalLM(lm_config)
-    model.to(args.device)
+    model = model.to(args.device)
     Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     
     # 创建 tokenizer 用于评测 benchmark
@@ -219,7 +222,7 @@ if __name__ == "__main__":
         from transformers import AutoTokenizer
         # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
         # 传模型的 tokenizer 的路径
-        tokenizer = AutoTokenizer.from_pretrained('')
+        tokenizer = AutoTokenizer.from_pretrained('tokenizer_15k')
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None
@@ -235,6 +238,7 @@ if __name__ == "__main__":
     Logger('Dataset ready')
     
     # 梯度缩放器和优化器
+    Logger('Initializing optimizer...')
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     Logger('Optimizer ready')
@@ -243,7 +247,11 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if ckp_data:
         Logger('Loading checkpoint...')
-        model.load_state_dict(ckp_data['model'])
+        if args.use_compile == 1:
+            raw_model = getattr(model, '_orig_mod', model)
+            raw_model.load_state_dict(ckp_data['model'])
+        else:
+            model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
@@ -261,8 +269,8 @@ if __name__ == "__main__":
         Logger('Running initial benchmark evaluation (step 0)...')
         model.eval()
         # benchmark 的数据路径
-        c3_path = 'benchmark/clue_c3_eval_500.jsonl'
-        xcopa_path = 'benchmark/xcopa_zh_merged.jsonl'
+        c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
+        xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
         eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
         
         if swanlab_run:
@@ -307,5 +315,5 @@ if __name__ == "__main__":
                 warmup_steps=warmup_steps, 
                 full_save_dir=full_save_dir
                 )
-            
+    
     Logger('Training done.')

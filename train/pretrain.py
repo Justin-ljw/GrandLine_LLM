@@ -1,5 +1,9 @@
 """
 GrandLine 预训练脚本（支持多卡 DDP）
+
+单机多卡-数据并行训练 DistributedDataParallel（DDP）：多个GPU协同训练，每个GPU一个进程，每个GPU都有完整的模型副本，且每个GPU中的模型始终保持一致。
+但每个GPU处理的是不同的数据分片（通过 DistributedSampler 实现），每个GPU计算自己的梯度，然后通过通信机制求出所有GPU的平均梯度来同步更新所有GPU的模型参数（类似于梯度累积）。
+
 与 pretrain_without_ddp.py 的差异已用 [DDP] 标出：主要为分布式初始化、Sampler、DDP 包模型、
 主进程判断（保存/评测）、总步数按 world_size 分片、训练循环用 train_sampler、结束时 destroy_process_group。
 """
@@ -18,16 +22,17 @@ import warnings
 import torch
 import torch.distributed as dist  # [DDP] 多进程/多 GPU 通信；without_ddp 无此 import
 from contextlib import nullcontext
-from torch import optim, nn
+from torch import optim
 from torch.nn.parallel import DistributedDataParallel  # [DDP] DDP 包模型；without_ddp 无
 from torch.utils.data import DataLoader, DistributedSampler  # [DDP] 多卡用 DistributedSampler；without_ddp 仅 DataLoader
+from dataset.pretrain_dataset import PretrainDataset
 from model.config import GrandLineConfig
 from model.model_grandline import GrandLineForCausalLM
-from dataset.pretrain_dataset import PretrainDataset
+
 from utils import get_lr, Logger, is_main_process, init_distributed_mode, SkipBatchSampler  # [DDP] is_main_process/init_distributed_mode 仅 DDP 用；without_ddp 无
 from benchmark.evaluator import run_benchmark
 
-_BENCH_PRETRAIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmark", "pretrain")
+_BENCH_PRETRAIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmark")
 
 warnings.filterwarnings('ignore')
 
@@ -56,51 +61,82 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=None, warmup_steps=None, full_save_dir=None):
+    '''
+    训练一个 epoch 的函数，包含前向传播、反向传播、日志打印、checkpoint 保存和 benchmark 评测
+    
+    Args:
+        epoch: 当前 epoch 索引
+        loader: 从 start_step 开始的 DataLoader 对象，提供训练数据
+        iters: 当前 epoch 的总迭代次数（steps）
+        start_step: 当前 epoch 已经完成的 step 数（用于断点续训）
+        swanlab: SwanLab 运行对象（可选，用于日志记录）
+        total_steps: 预训练的总步数（用于学习率调度）
+        warmup_steps: 学习率预热的步数（用于学习率调度）
+        full_save_dir: 模型 checkpoint 的保存目录（用于保存模型权重）
+    '''
     start_time = time.time()
+    
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+        input_ids, labels = input_ids.to(args.device), labels.to(args.device)
+        
         current_step = epoch * iters + step
-        lr = get_lr(current_step, total_steps, args.learning_rate, warmup_steps)
+        
+        # 根据当前 step 调节学习率，并设置到优化器中
+        lr = get_lr(
+            lr=args.learning_rate, 
+            current_step=current_step, 
+            total_steps=total_steps, 
+            warmup_steps=warmup_steps)
+        
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
+        
+        # 自动混合精度训练 搭配 梯度缩放防止下溢
         with autocast_ctx:
-            res = model(input_ids, labels=labels)
+            res = model(input_ids=input_ids, labels=labels)
             loss = res.loss / args.accumulation_steps
-
+            
+        # 梯度放大防止下溢
         scaler.scale(loss).backward()
-
+        
+        # 梯度累积以实现更大的有效 batch size
         if (step + 1) % args.accumulation_steps == 0:
+            # 把梯度从放大状态恢复到正常状态，并更新模型参数
             scaler.unscale_(optimizer)
+            # 梯度裁剪，防止梯度爆炸，减缓训练波动
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
             scaler.step(optimizer)
+            # 自适应调节缩放系数
             scaler.update()
-
             optimizer.zero_grad(set_to_none=True)
-
+            
         global_step = epoch * iters + step
         
+        # 定期打印日志
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
+            current_loss = loss.item() * args.accumulation_steps
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if swanlab: swanlab.log({"loss": current_loss, "learning_rate": current_lr, "eta_time": eta_min}, step=global_step)
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), Loss: {current_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            
+            if swanlab:
+                swanlab.log({"loss": current_loss, "learning_rate": current_lr, "eta_time": eta_min}, step=global_step)
         
         # 保存 checkpoint [DDP] 仅主进程写盘；without_ddp 无 is_main_process() 判断
         if (global_step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
+            
             ckp_dir = f'{full_save_dir}/global_step_{global_step}'
             os.makedirs(ckp_dir, exist_ok=True)
+            
             # [DDP] DDP 下取 .module 才是真实模型；without_ddp 仅 getattr(model, '_orig_mod', model)
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            # 把权重参数转换为 FP16 来保存
             state_dict = {k: v.half().cpu() for k, v in raw_model.state_dict().items()}
-            
             torch.save(state_dict, f'{ckp_dir}/{args.save_weight}_{lm_config.hidden_size}.pth')
+            # 同时保存一个 resume.pth，方便后续断点续训时自动加载
             torch.save({
                 'model': state_dict,
                 'optimizer': optimizer.state_dict(),
@@ -111,30 +147,35 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
                 'swanlab_id': getattr(swanlab, 'id', None) if swanlab else None
             }, f'{ckp_dir}/resume.pth')
             
-            Logger(f'Saved checkpoint: {ckp_dir}')
+            Logger(f'Checkpoint saved at step {global_step} to {ckp_dir}')
             model.train()
-        
+
         # Benchmark 评测 [DDP] 仅主进程跑；without_ddp 无 is_main_process() 判断
         if args.eval_bench == 1 and tokenizer is not None and global_step % args.eval_interval == 0 and is_main_process():
             model.eval()
+            # benchmark 的数据路径
             c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
             xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
-            eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
-            if swanlab_run:
-                swanlab_run.log(eval_results, step=global_step)
-            Logger(f'Benchmark results: {eval_results}')
+            eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
+            
+            if swanlab:
+                swanlab.log(eval_results, step=global_step)
+            Logger(f'Benchmark evaluated at step {global_step}: {eval_results}')
+            
             model.train()
 
+        # 清理本 epoch 的变量，释放显存
         del input_ids, labels, res, loss
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GrandLine Pretraining")
-    parser.add_argument("--save_dir", type=str, default="../pretrain_out/exp_mini", help="模型保存根目录")
+    parser.add_argument("--save_dir", type=str, default="../model_weight/pretrain/exp_DDP_1", help="模型保存根目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="初始学习率")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减系数")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
@@ -155,20 +196,19 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
     args = parser.parse_args()
 
+
     # ========== 1. [DDP] 初始化分布式环境 ==========
     # without_ddp 无此步骤，直接进入配置目录
     local_rank = init_distributed_mode()  # 多卡时初始化进程组并返回本卡 GPU 号
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"  # DDP 时每进程用不同 GPU
 
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
-    lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
-    
+    # ========== 2. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
     run_name = f"h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
-    # 从最新的 checkpoint 恢复
+    # 断点续训时自动检测最新 checkpoint 并加载
     ckp_data = None
     if args.from_resume == 1:
         ckp_dirs = [d for d in os.listdir(full_save_dir) if d.startswith('global_step_')]
@@ -186,12 +226,11 @@ if __name__ == "__main__":
     
     # ========== 4. 配置swanlab ==========
     swanlab_run = None
-    if args.use_swanlab and is_main_process():  # [DDP] 仅主进程上报；without_ddp 无 is_main_process()
+    if args.use_swanlab == 1 and is_main_process():  # [DDP] 仅主进程上报；without_ddp 无 is_main_process()
         import swanlab
+        # 传自己的 API Key
         swanlab.login(api_key="")
-        
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
-        
         swanlab_run = swanlab.init(
             project=args.swanlab_project,
             experiment_name=run_name,
@@ -202,40 +241,44 @@ if __name__ == "__main__":
         Logger(f'SwanLab initialized: {run_name}')
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    # 创建模型
-    if args.from_weight != 'none' and os.path.exists(args.from_weight):
+    lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
+    
+    # 创建或加载模型
+    if args.from_weight.lower() != 'none' and os.path.exists(args.from_weight):
         Logger(f'Loading model from {args.from_weight}')
         model = GrandLineForCausalLM.from_pretrained(args.from_weight)
     else:
         Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
         model = GrandLineForCausalLM(lm_config)
-    
     model = model.to(args.device)
     Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     
     # 加载 tokenizer（用于 benchmark 评测）
     if args.eval_bench == 1:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained('')
+        # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
+        # 传模型的 tokenizer 的路径
+        tokenizer = AutoTokenizer.from_pretrained('tokenizer_15k')
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None
     
+    # 使用 torch.compile 加速模型前向和反向传播
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     
     # 数据集（加载预处理好的.bin文件）
     Logger('Loading dataset...')
-    train_ds = PretrainDataset(args.data_path, seq_len=args.max_seq_len)
+    train_ds = PretrainDataset(data_path=args.data_path, seq_len=args.max_seq_len)
     # [DDP] 多卡用 DistributedSampler 分片；without_ddp 无 train_sampler，后面用 indices
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     Logger('Dataset ready')
     
-    # 优化器
+    # 梯度缩放器和优化器
     Logger('Initializing optimizer...')
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     Logger('Optimizer ready')
     
     # ========== 6. 从ckp恢复状态 ==========
@@ -275,31 +318,58 @@ if __name__ == "__main__":
     if args.eval_bench == 1 and tokenizer is not None and is_main_process() and start_epoch == 0 and start_step == 0:
         Logger('Running initial benchmark evaluation (step 0)...')
         model.eval()
+        # benchmark 的数据路径
         c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
         xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
-        eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
+        eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
+        
         if swanlab_run:
             swanlab_run.log(eval_results, step=0)
         Logger(f'Initial benchmark results (step 0): {eval_results}')
+        
         model.train()
     
     # ========== 9. 开始训练 ==========
     Logger(f'Starting training: {args.epochs} epochs, batch_size={args.batch_size}')
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)  # [DDP] 多卡时打乱各卡分片；without_ddp 无此行
-        indices = torch.randperm(len(train_ds)).tolist()
+        # 用 epoch 固定种子，保证续训时同一 epoch 的打乱顺序与初次训练完全一致
+        g = torch.Generator()
+        g.manual_seed(epoch)
+        indices = torch.randperm(len(train_ds), generator=g).tolist()
+        
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         # [DDP] 多卡用 train_sampler，单卡用 indices；without_ddp 仅 SkipBatchSampler(indices, ...)
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         Logger(f'Creating DataLoader for epoch {epoch+1}...')
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         Logger(f'DataLoader ready, starting epoch {epoch+1}...')
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, swanlab_run, total_steps, warmup_steps, full_save_dir)
+            train_epoch(
+                epoch=epoch, 
+                loader=loader, 
+                iters=len(loader) + skip, 
+                start_step=start_step, 
+                swanlab=swanlab_run, 
+                total_steps=total_steps, 
+                warmup_steps=warmup_steps, 
+                full_save_dir=full_save_dir
+                )
         else:
-            train_epoch(epoch, loader, len(loader), 0, swanlab_run, total_steps, warmup_steps, full_save_dir)
+            train_epoch(
+                epoch=epoch, 
+                loader=loader, 
+                iters=len(loader), 
+                start_step=0, 
+                swanlab=swanlab_run, 
+                total_steps=total_steps, 
+                warmup_steps=warmup_steps, 
+                full_save_dir=full_save_dir
+                )
     
     # ========== 10. [DDP] 清理分布式进程组 ==========
     # without_ddp 无此步骤，仅 Logger('Training done.')
     if dist.is_initialized(): dist.destroy_process_group()
+    
+    Logger('Training done.')
