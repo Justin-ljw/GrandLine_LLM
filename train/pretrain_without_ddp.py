@@ -274,8 +274,12 @@ if __name__ == "__main__":
     # ========== 8. 训练循环 ==========
     Logger(f'Starting training: {args.epochs} epochs, batch_size={args.batch_size} (single GPU)')
     for epoch in range(start_epoch, args.epochs):
+        # 用 epoch 固定种子，保证续训时同一 epoch 的打乱顺序与初次训练完全一致
+        g = torch.Generator()
+        g.manual_seed(epoch)
+        indices = torch.randperm(len(train_ds), generator=g).tolist()
+        
         # 使用 SkipBatchSampler 处理 DataLoader ，跳过前 start_step 个 batch ，适用于断点续训
-        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(sampler=indices, batch_size=args.batch_size, skip_batches=skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
