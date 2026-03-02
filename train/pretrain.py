@@ -259,7 +259,7 @@ if __name__ == "__main__":
         from transformers import AutoTokenizer
         # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
         # 传模型的 tokenizer 的路径
-        tokenizer = AutoTokenizer.from_pretrained('tokenizer_15k')
+        tokenizer = AutoTokenizer.from_pretrained('../tokenizer_15k')
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None
