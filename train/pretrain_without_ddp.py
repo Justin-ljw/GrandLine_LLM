@@ -145,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="初始学习率")
+    parser.add_argument("--warmup_percent", type=float, default=0.03, help="warmup 占比 3%")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减系数")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -200,6 +201,7 @@ if __name__ == "__main__":
             project=args.swanlab_project,
             experiment_name=run_name,
             id=swanlab_id,
+            resume=True,
             config=vars(args)
         )
         Logger(f'SwanLab initialized: {run_name}')
@@ -261,7 +263,7 @@ if __name__ == "__main__":
     # ========== 6. 总步数（单卡）==========
     steps_per_epoch = len(train_ds) // args.batch_size
     total_steps = args.epochs * steps_per_epoch
-    warmup_steps = int(total_steps * 0.03)  # 3% 的 warmup
+    warmup_steps = int(total_steps * args.warmup_percent)  # 3% 的 warmup
     Logger(f'Steps per epoch: {steps_per_epoch}, Total steps: {total_steps}, Warmup: {warmup_steps}')
     
     # ========== 7. 初始评测 (step 0) ==========

@@ -463,11 +463,11 @@ class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
             shift_logits = logits[..., : -1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()  # token id 序列
             
-            # 把 logits 和 labels 展平到二维和一维，计算交叉熵损失，ignore_index=-100 用于忽略 padding 和 mask 的位置
+            # 把 logits 和 labels 展平到二维和一维，计算交叉熵损失，ignore_index=-100 用于忽略 padding 和 prompt 的位置
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)), 
                 shift_labels.view(-1), 
-                ignore_index=-100  # 忽略 padding 和 mask 的位置
+                ignore_index=-100  # 忽略 padding 和 prompt 的位置
             )
         
         # 把数据组织成类输出，包含 loss, logits, past_key_values, hidden_states

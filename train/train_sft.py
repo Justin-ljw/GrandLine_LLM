@@ -1,11 +1,13 @@
 """
-GrandLine 预训练脚本（支持多卡 DDP）
+SFT 训练脚本：由 pretrain.py 复制后做少量修改得到，便于与预训练对比讲解。
+改动处均用 # [SFT] 标出。
 
-单机多卡-数据并行训练 DistributedDataParallel（DDP）：多个GPU协同训练，每个GPU一个进程，每个GPU都有完整的模型副本，且每个GPU中的模型始终保持一致。
-但每个GPU处理的是不同的数据分片（通过 DistributedSampler 实现），每个GPU计算自己的梯度，然后通过通信机制求出所有GPU的平均梯度来同步更新所有GPU的模型参数（类似于梯度累积）。
-
-与 pretrain_without_ddp.py 的差异已用 [DDP] 标出：主要为分布式初始化、Sampler、DDP 包模型、
-主进程判断（保存/评测）、总步数按 world_size 分片、训练循环用 train_sampler、结束时 destroy_process_group。
+主要差异：
+1. 数据集：PretrainDataset(.bin) → SFTDataset(jsonl 对话数据，只算 assistant loss)
+2. Tokenizer：SFT 需提前加载（Dataset 需要），pretrain 仅评测时加载
+3. 模型加载：pretrain 用 from_pretrained，SFT 用 load_state_dict 加载 .pth
+4. 评测方式：pretrain 用 C3/XCOPA benchmark，SFT 用 mini_bench + DeepSeek Judge 生成式评测
+5. 新增参数：tokenizer_path, judge_api_key, judge_model
 """
 import os
 import sys
@@ -25,41 +27,18 @@ from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel  # [DDP] DDP 包模型；without_ddp 无
 from torch.utils.data import DataLoader, DistributedSampler  # [DDP] 多卡用 DistributedSampler；without_ddp 仅 DataLoader
-from dataset.pretrain_dataset import PretrainDataset
+from transformers import AutoTokenizer  # [SFT] SFT 需一开始就加载 tokenizer（给 SFTDataset 用），pretrain 仅在 eval_bench=1 时加载
+from dataset.sft_dataset import SFTDataset  # [SFT] pretrain 用 PretrainDataset(.bin)，SFT 用 SFTDataset(jsonl + 只算 assistant loss)
 from model.config import GrandLineConfig
 from model.model_grandline import GrandLineForCausalLM
 
 from utils import get_lr, Logger, is_main_process, init_distributed_mode, SkipBatchSampler  # [DDP] is_main_process/init_distributed_mode 仅 DDP 用；without_ddp 无
-from benchmark.evaluator import run_benchmark
-
-_BENCH_PRETRAIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmark")
+from benchmark.mini_bench.eval import run_inference, run_judge_async  # [SFT] mini_bench 评测函数，推理 + Judge；pretrain 用 run_benchmark (C3/XCOPA)
 
 warnings.filterwarnings('ignore')
 
-###auto_cast用法
-# from torch.cuda.amp import GradScaler, autocast
 
-# scaler = GradScaler() # 初始化
-
-# for data, target in data_loader:
-#     optimizer.zero_grad()
-
-#     with autocast(): # 开启半精度前向传播
-#         output = model(data)
-#         loss = loss_fn(output, target)
-
-#     # 1. 放大 Loss 并计算梯度
-#     scaler.scale(loss).backward()
-
-#     # 2. scaler.step() 会先取消缩放梯度 (unscale)
-#     # 如果梯度没溢出，则调用 optimizer.step() 更新参数
-#     # 如果溢出了，则跳过这一步
-#     scaler.step(optimizer)
-
-#     # 3. 更新缩放因子（根据是否有溢出来决定下次放大多少）
-#     scaler.update()
-
-
+# 与 pretrain 基本相同
 def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=None, warmup_steps=None, full_save_dir=None):
     '''
     训练一个 epoch 的函数，包含前向传播、反向传播、日志打印、checkpoint 保存和 benchmark 评测
@@ -150,32 +129,43 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
             Logger(f'Checkpoint saved at step {global_step} to {ckp_dir}')
             model.train()
 
+        # [SFT] 自定义 mini_bench 评测(LLM as Judge)：每到 eval_interval 用当前模型推理，异步调用 DeepSeek 进行 Judge
+        # pretrain 用 run_benchmark (C3/XCOPA)，SFT 用 run_inference + run_judge_async (生成式评测)
         # Benchmark 评测 [DDP] 仅主进程跑；without_ddp 无 is_main_process() 判断
         if args.eval_bench == 1 and tokenizer is not None and global_step % args.eval_interval == 0 and is_main_process():
+            # 解包获取原始模型
+            raw = model.module if isinstance(model, DistributedDataParallel) else model
+            raw = getattr(raw, "_orig_mod", raw)
+            #开启评测模式
             model.eval()
-            # benchmark 的数据路径
-            c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
-            xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
-            eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
-            
-            if swanlab:
-                swanlab.log(eval_results, step=global_step)
-            Logger(f'Benchmark evaluated at step {global_step}: {eval_results}')
-            
+            # 给模型输入 mini_bench 的 prompt ，让模型生成回答
+            pairs = run_inference(raw, tokenizer, device=args.device, num_samples=3)
+            # 模型推理完成就可以继续训练了，Judge 的评测在后台异步进行，不会阻塞训练
             model.train()
+            
+            valid_dir = os.path.join(full_save_dir, "valid_samples")
+            valid_file = os.path.join(valid_dir, f"global_step_{global_step}.jsonl")
+            # 异步调用 LLM Judge 评测，传入模型生成的回答和自己的 LLM Judge API Key
+            run_judge_async(pairs, args.judge_api_key, args.judge_model,
+                           output_file=valid_file,
+                           swanlab_log_fn=swanlab.log if swanlab else None,
+                           global_step=global_step)
+            Logger(f'[eval] step={global_step} 推理完成，Judge 后台运行中...')
 
         # 清理本 epoch 的变量，释放显存
         del input_ids, labels, res, loss
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GrandLine Pretraining")
-    parser.add_argument("--save_dir", type=str, default="../model_weight/pretrain/exp_DDP_1", help="模型保存根目录")
-    parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
+    parser = argparse.ArgumentParser(description="GrandLine SFT Training")
+    # [SFT] 以下参数默认值与 pretrain.py 不同：save_dir, save_weight, epochs, data_path, from_weight, swanlab_project
+    # [SFT] 新增参数：tokenizer_path, ollama_url, ollama_model
+    parser.add_argument("--save_dir", type=str, default="../model_weight/sft/exp_1", help="模型保存根目录")
+    parser.add_argument('--save_weight', default='sft', type=str, help="保存权重的前缀名")
+    parser.add_argument("--epochs", type=int, default=2, help="训练轮数（SFT 推荐 2-3 epoch，过多会过拟合）")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="初始学习率")
-    parser.add_argument("--warmup_percent", type=float, default=0.03, help="warmup 占比 3%")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="初始学习率（SFT 推荐 1e-5 ~ 1e-4，从预训练继续可用 5e-5）")
+    parser.add_argument("--warmup_percent", type=float, default=0.1, help="warmup 占比（SFT 推荐更长 warmup，0.1 即 10%）")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减系数")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -183,18 +173,22 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=3000, help="模型保存间隔")
+    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
-    parser.add_argument("--data_path", type=str, default="", help="预处理后的.bin文件路径")
-    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
+    parser.add_argument("--data_path", type=str, default="", help="SFT 数据 jsonl 路径")
+    parser.add_argument("--tokenizer_path", type=str, default="../tokenizer_15k", help="tokenizer 路径")  # [SFT] 新增：SFTDataset 需要 tokenizer
+    parser.add_argument('--from_weight', default='', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_swanlab", type=int, default=1, choices=[0, 1], help="是否使用swanlab（0=否，1=是）")
-    parser.add_argument("--swanlab_project", type=str, default="GrandLine-Pretrain", help="swanlab项目名")
+    parser.add_argument("--swanlab_project", type=str, default="GrandLine-SFT", help="swanlab项目名")
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
-    parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
+    parser.add_argument("--eval_interval", type=int, default=1000, help="每隔多少 step 跑 mini_bench（0=关闭），用当前模型推理+DeepSeek Judge 打分")
+    # [SFT] 新增：mini_bench 评测参数（使用 DeepSeek API）
+    parser.add_argument("--judge_api_key", type=str, default='', help="Judge API Key（可直接传入或从环境变量 DEEPSEEK_API_KEY 读取）")
+    parser.add_argument("--judge_model", type=str, default="deepseek-chat", help="Judge 模型名")
     args = parser.parse_args()
 
 
@@ -205,7 +199,7 @@ if __name__ == "__main__":
 
     # ========== 2. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
-    run_name = f"DDP_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    run_name = f"_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -244,34 +238,32 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
     
+    # [SFT] 先加载 tokenizer（SFT 数据集需要，pretrain 仅在 eval_bench=1 时加载）
+    Logger(f'Loading tokenizer from {args.tokenizer_path}')
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    
     # 创建或加载模型
+    # [SFT] 用 load_state_dict 加载 .pth 权重文件，pretrain 用 from_pretrained 加载模型目录
     if args.from_weight.lower() != 'none' and os.path.exists(args.from_weight):
         Logger(f'Loading model from {args.from_weight}')
-        model = GrandLineForCausalLM.from_pretrained(args.from_weight)
+        model = GrandLineForCausalLM(lm_config)
+        model.load_state_dict(torch.load(args.from_weight, map_location='cpu'), strict=False)
     else:
         Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
         model = GrandLineForCausalLM(lm_config)
+        
     model = model.to(args.device)
     Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    
-    # 加载 tokenizer（用于 benchmark 评测）
-    if args.eval_bench == 1:
-        from transformers import AutoTokenizer
-        # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
-        # 传模型的 tokenizer 的路径
-        tokenizer = AutoTokenizer.from_pretrained('tokenizer_15k')
-        Logger('Tokenizer loaded for benchmark evaluation')
-    else:
-        tokenizer = None
     
     # 使用 torch.compile 加速模型前向和反向传播
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     
-    # 数据集（加载预处理好的.bin文件）
+    # [SFT] 数据集：SFTDataset 读取 jsonl 对话数据，只计算 assistant 部分的 loss
+    # pretrain 用 PretrainDataset 读取预处理好的 .bin 文件，计算全部 token 的 loss
     Logger('Loading dataset...')
-    train_ds = PretrainDataset(data_path=args.data_path, seq_len=args.max_seq_len)
+    train_ds = SFTDataset(jsonl_path=args.data_path, tokenizer=tokenizer, max_length=args.max_seq_len)
     # [DDP] 多卡用 DistributedSampler 分片；without_ddp 无 train_sampler，后面用 indices
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     Logger('Dataset ready')
@@ -310,25 +302,27 @@ if __name__ == "__main__":
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     steps_per_epoch = len(train_ds) // (args.batch_size * world_size)
     total_steps = args.epochs * steps_per_epoch
-    warmup_steps = int(total_steps * args.warmup_percent)  # 3% warmup
+    warmup_steps = int(total_steps * args.warmup_percent)  # 10% warmup（SFT 推荐更长 warmup）
     Logger(f'World size: {world_size}, Steps per epoch: {steps_per_epoch}')
-    Logger(f'Total training steps: {total_steps}, Warmup steps: {warmup_steps} (3%)')
+    Logger(f'Total training steps: {total_steps}, Warmup steps: {warmup_steps} (10%)')
     
     # ========== 8.5. 初始评测 (step 0) ==========
     # [DDP] 仅主进程评测；without_ddp 无 is_main_process()
     if args.eval_bench == 1 and tokenizer is not None and is_main_process() and start_epoch == 0 and start_step == 0:
-        Logger('Running initial benchmark evaluation (step 0)...')
+        Logger('Running initial mini_bench evaluation (step 0)...')
+        raw = model.module if isinstance(model, DistributedDataParallel) else model
+        raw = getattr(raw, "_orig_mod", raw)
         model.eval()
-        # benchmark 的数据路径
-        c3_path = os.path.join(_BENCH_PRETRAIN_DIR, "clue_c3_eval_500.jsonl")
-        xcopa_path = os.path.join(_BENCH_PRETRAIN_DIR, "xcopa_zh_merged.jsonl")
-        eval_results = run_benchmark(model=model, tokenizer=tokenizer, c3_path=c3_path, xcopa_path=xcopa_path)
-        
-        if swanlab_run:
-            swanlab_run.log(eval_results, step=0)
-        Logger(f'Initial benchmark results (step 0): {eval_results}')
-        
+        pairs = run_inference(raw, tokenizer, device=args.device, num_samples=3)
         model.train()
+        
+        valid_dir = os.path.join(full_save_dir, "valid_samples")
+        valid_file = os.path.join(valid_dir, f"global_step_0.jsonl")
+        run_judge_async(pairs, args.judge_api_key, args.judge_model,
+                       output_file=valid_file,
+                       swanlab_log_fn=swanlab_run.log if swanlab_run else None,
+                       global_step=0)
+        Logger('[eval] step=0 初始评测完成，Judge 后台运行中...')
     
     # ========== 9. 开始训练 ==========
     Logger(f'Starting training: {args.epochs} epochs, batch_size={args.batch_size}')
