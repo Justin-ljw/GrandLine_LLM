@@ -90,28 +90,3 @@ class SFTDataset(Dataset):
             labels.extend([-100] * padding_length)  # padding 不计算 loss
         
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
-
-
-if __name__ == "__main__":
-    # 简单测试
-    from transformers import AutoTokenizer
-    
-    tokenizer = AutoTokenizer.from_pretrained("../tokenizer_15k")
-    dataset = SFTDataset("../data_raw/mini/sft_512_2M.jsonl", tokenizer, max_length=512)
-    
-    print(f"\n数据集大小: {len(dataset)}")
-    
-    # 查看第一个样本
-    input_ids, labels = dataset[0]
-    print(f"\n第一个样本:")
-    print(f"input_ids shape: {input_ids.shape}")
-    print(f"labels shape: {labels.shape}")
-    
-    # 解码前 100 个 tokens
-    print(f"\n前 100 个 tokens:")
-    for i in range(min(100, len(input_ids))):
-        token = input_ids[i].item()
-        label = labels[i].item()
-        decoded = tokenizer.decode([token])
-        loss_marker = "✓" if label != -100 else "✗"
-        print(f"{i:3d}: [{token:5d}] {decoded:20s} | label={label:5d} {loss_marker}")
