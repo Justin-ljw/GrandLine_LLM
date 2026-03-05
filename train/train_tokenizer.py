@@ -13,7 +13,8 @@ os.environ['RAYON_NUM_THREADS'] = str(NUM_THREADS)
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 # 配置
-DATA_PATH = 'data\pretrain_data\spongebob_pretrain.jsonl'
+# tonkenizer 训练数据路径，文件应为 jsonl 格式，包含"text"字段（一般用 pretrain 数据，可对训练数据有较高的压缩率）
+DATA_PATH = ''
 TOKENIZER_DIR = 'tokenizer_15k'
 VOCAB_SIZE = 15000
 
