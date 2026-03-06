@@ -417,6 +417,22 @@ class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
         # language modeling head，与 token embedding 共享权重
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_token.weight = self.lm_head.weight  # 权重共享
+    
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        """
+        为 generation 处理输入：如果有过去计算的 KV cache，则只输入最后一个 token
+        """
+        # 如果 past_key_values 存在，说明之前已经把前面的 token 缓存了
+        if past_key_values is not None:
+            # 只有最后生成的那个 token 需要送入模型，大大节省算力
+            input_ids = input_ids[:, -1:]
+            
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True),
+            "attention_mask": attention_mask,
+        }    
         
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None, 
