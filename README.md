@@ -163,7 +163,7 @@ GrandLine_LLM 是一个从零开始构建的 **类 Qwen 3 Dense架构 / Deepseek
 ![GRPO Mean Reward](images/GRPO_Mean.jpg)
 ![GRPO Format](images/GRPO_Format.jpg)
 ![GRPO Judge](images/GRPO_LLM_Judge.jpg)
-![GRPO Solve All Solve None](<images/GRPO_Solve_All_ None.jpg>)
+![GRPO Solve All Solve None](images/GRPO_Solve_All_None.jpg)
 ![GRPO KL and Length](images/GRPO_KL_Length.jpg)
 
 **训练结果分析**：
