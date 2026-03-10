@@ -8,7 +8,7 @@ mini_bench 评测：推理 + Judge（使用 DeepSeek API）
 import os, json, re, torch
 from pathlib import Path
 
-_BENCH_JSONL = Path(__file__).parent / "100miniSponge.jsonl"
+_BENCH_JSONL = Path(__file__).parent / "100_mini_prompt.jsonl"
 DIMENSIONS = ["fluency", "factuality", "instruction_following"]
 
 JUDGE_PROMPT = """请根据问题对以下回答进行评分（0-1 二值）：
