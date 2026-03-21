@@ -272,10 +272,18 @@ GrandLine_LLM/
 
 ## 📦 模型权重下载 (Downloads)
 
-模型权重已托管至 ModelScope (魔搭社区)，欢迎下载体验：
+模型权重已分别托管至 **Hugging Face** 与 **ModelScope (魔搭社区)**，您可以根据网络环境选择任意一个平台下载体验：
+
+### 📌 方式一：从 Hugging Face 下载
+```bash
+pip install huggingface_hub
+huggingface-cli download JustinLeee/GrandLine_LLM --include "dense/*" --local-dir ./model_weight
+```
+
+### 📌 方式二：从 ModelScope 下载 (国内推荐)
 ```bash
 pip install modelscope
-modelscope download --model JustinLeee/GrandLine_LLM --local_dir ./model_weight
+modelscope download --model JustinLeee/GrandLine_LLM --include "dense/*" dense/ --local_dir ./model_weight
 ```
 
 ---
