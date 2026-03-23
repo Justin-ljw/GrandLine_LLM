@@ -283,7 +283,7 @@ huggingface-cli download JustinLeee/GrandLine_LLM --include "dense/*" --local-di
 ### 📌 方式二：从 ModelScope 下载 (国内推荐)
 ```bash
 pip install modelscope
-modelscope download --model JustinLeee/GrandLine_LLM --include "dense/*" dense/ --local_dir ./model_weight
+modelscope download --model JustinLeee/GrandLine_LLM --include "dense/*" --local_dir ./model_weight
 ```
 
 ---
