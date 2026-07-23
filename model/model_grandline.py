@@ -8,6 +8,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, Tuple, List, Union
 from .config import GrandLineConfig
 
+from .attn_output_gate import AttnOutputGate
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int , eps: float = 1e-05):
         super().__init__()
@@ -132,6 +134,12 @@ class Attention(nn.Module):
         # Flash Attention 支持检测
         self.flash_attn = hasattr(nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         
+        # Gated Attention
+        if getattr(args, 'attn_gate_type', 'none') != 'none':
+            self.attn_output_gate = AttnOutputGate(args)
+        else:
+            self.attn_output_gate = None
+        
     def forward(
         self, 
         x: torch.Tensor, 
@@ -236,6 +244,10 @@ class Attention(nn.Module):
             attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
             attn_weights = self.attn_dropout(attn_weights)
             attn_output = torch.matmul(attn_weights, xv)  # (batch, num_attention_heads, q_len, head_dim)
+        
+        # Gated Attention
+        if self.attn_output_gate is not None:
+            attn_output = attn_output * self.attn_output_gate(x)
         
         # 将多头合并回 (batch, seq_len, hidden_size)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)

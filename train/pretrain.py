@@ -195,6 +195,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
     parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
+    # Gated Attention
+    parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型")
+    parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
+    
     args = parser.parse_args()
 
 
@@ -242,7 +246,11 @@ if __name__ == "__main__":
         Logger(f'SwanLab initialized: {run_name}')
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
+    lm_config = GrandLineConfig(hidden_size=args.hidden_size,
+                                num_hidden_layers=args.num_hidden_layers, 
+                                # Gated Attention
+                                attn_gate_type=args.attn_gate_type, 
+                                attn_gate_init_bias=args.attn_gate_init_bias)
     
     # 创建或加载模型
     if args.from_weight.lower() != 'none' and os.path.exists(args.from_weight):

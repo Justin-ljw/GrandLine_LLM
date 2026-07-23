@@ -11,6 +11,7 @@ class GrandLineConfig(PretrainedConfig):
         num_hidden_layers: Transformer-Decoder 层数
         num_attention_heads: 注意力Query头数
         num_key_value_heads: KV 头数（用于 Grouped Query Attention）
+        head_size: 每个头的维度
         intermediate_size: FFN 中间层维度
         vocab_size: 词表大小
         num_experts: MoE专家数量
@@ -23,6 +24,10 @@ class GrandLineConfig(PretrainedConfig):
         bos_token_id: 开始 token ID
         eos_token_id: 结束 token ID
         flash_attn: 是否启用 Flash Attention
+        
+        # Gated Attention
+        attn_gate_type: gate attn的粒度
+        attn_gate_init_bias: W_gate的初始偏置值（较大，用于抵消W全0初始化带来的训练波动，使得初始时gate影响很小）
     """
     
     def __init__(
@@ -32,6 +37,7 @@ class GrandLineConfig(PretrainedConfig):
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
         num_key_value_heads: int = 4,
+        head_size: int = 64, 
         intermediate_size: int = 2048,
         vocab_size: int = 15000,
         
@@ -50,6 +56,11 @@ class GrandLineConfig(PretrainedConfig):
         
         # flash注意力机制
         flash_attn: bool = True,
+        
+        # Gated Attention
+        attn_gate_type: str = 'none',
+        attn_gate_init_bias: float = 4.0, 
+        
         **kwargs):
             super().__init__(**kwargs)
             
@@ -57,6 +68,7 @@ class GrandLineConfig(PretrainedConfig):
             self.num_hidden_layers = num_hidden_layers
             self.num_attention_heads = num_attention_heads
             self.num_key_value_heads = num_key_value_heads
+            self.head_size = head_size
             self.intermediate_size = intermediate_size
             self.vocab_size = vocab_size
             self.max_position_embeddings = max_position_embeddings
@@ -67,6 +79,12 @@ class GrandLineConfig(PretrainedConfig):
             self.bos_token_id = bos_token_id
             self.eos_token_id = eos_token_id
             self.flash_attn = flash_attn
+            
+            # Gated Attention
+            if attn_gate_type not in ("none", "token", "head", "channel"):
+                raise ValueError(f'Invalid attn_gate_type={attn_gate_type}')
+            self.attn_gate_type = attn_gate_type
+            self.attn_gate_init_bias = attn_gate_init_bias
 
     
     
