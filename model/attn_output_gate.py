@@ -22,7 +22,7 @@ class AttnOutputGate(nn.Module):
         nn.init.zeros_(self.W_g.weight)
         nn.init.constant_(self.W_g.bias, self.init_bias)
         
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor :
         """
             x: (batch_size, seq_len, hidden_size)
             attn_output: (batch_size, num_attn_head, seq_len, head_size)

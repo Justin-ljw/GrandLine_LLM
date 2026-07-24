@@ -26,7 +26,7 @@ class GrandLineConfig(PretrainedConfig):
         flash_attn: 是否启用 Flash Attention
         
         # Gated Attention
-        attn_gate_type: gate attn的粒度
+        attn_gate_type: gate attn的粒度，只能是("none", "token", "head", "channel")之一，其中"none"表示不使用gate
         attn_gate_init_bias: W_gate的初始偏置值（较大，用于抵消W全0初始化带来的训练波动，使得初始时gate影响很小）
     """
     
