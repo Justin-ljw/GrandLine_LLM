@@ -8,13 +8,14 @@ set -euo pipefail
 #
 # 常用改法：
 #   DEVICE=cpu bash scripts/run_pretrain_demo.sh
-#   GLOBAL_BATCH_SIZE=256 bash scripts/run_pretrain_demo.sh
-#   NPROC_PER_NODE=4 GLOBAL_BATCH_SIZE=512 bash scripts/run_pretrain_demo.sh
+#   BATCH_SIZE=256 bash scripts/run_pretrain_demo.sh
+#   NPROC_PER_NODE=4 BATCH_SIZE=512 bash scripts/run_pretrain_demo.sh
 #   HIDDEN_SIZE=768 NUM_ATTENTION_HEADS=12 HEAD_SIZE=80 bash scripts/run_pretrain_demo.sh
 #
 # 可选环境变量：
 #   DATA_BIN, SAVE_DIR, DEVICE, EPOCHS, GLOBAL_BATCH_SIZE, LEARNING_RATE
 #   LOG_INTERVAL, SAVE_INTERVAL, EVAL_INTERVAL
+#   USE_COMPILE
 #   HIDDEN_SIZE, NUM_HIDDEN_LAYERS, NUM_ATTENTION_HEADS, HEAD_SIZE
 #   NUM_KEY_VALUE_HEADS, INTERMEDIATE_SIZE, VOCAB_SIZE
 #   MAX_SEQ_LEN, MAX_POSITION_EMBEDDINGS, ROPE_THETA, HIDDEN_ACT, DROPOUT
@@ -42,14 +43,14 @@ SAVE_DIR="${SAVE_DIR:-$ROOT/pretrain_out/demo}"
 # 2) 最核心的训练参数
 DEVICE="${DEVICE:-cuda:0}"
 EPOCHS="${EPOCHS:-2}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 LEARNING_RATE="${LEARNING_RATE:-1e-3}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-3000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-768}"
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-12}"
-NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-16}"
+NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-12}"
 HEAD_SIZE="${HEAD_SIZE:-64}"
 NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-4}"
 INTERMEDIATE_SIZE="${INTERMEDIATE_SIZE:-2048}"
@@ -61,21 +62,22 @@ HIDDEN_ACT="${HIDDEN_ACT:-silu}"
 DROPOUT="${DROPOUT:-0.0}"
 
 # gated attention
-ATTN_GATE_TYPE="${ATTN_GATE_TYPE:-channel}"
-ATTN_GATE_INIT_BIAS="${ATTN_GATE_INIT_BIAS:-0.0}"
+ATTN_GATE_TYPE="${ATTN_GATE_TYPE:-head}"
+ATTN_GATE_INIT_BIAS="${ATTN_GATE_INIT_BIAS:-4.0}"
 ENABLE_GATE_MONITOR="${ENABLE_GATE_MONITOR:-1}"
 
 
 
 # 3) 分布式参数
 # NPROC_PER_NODE=1 表示单卡；大于 1 表示单机多卡
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 # 4）评测/swanlab记录参数
 EVAL_BENCH="${EVAL_BENCH:-1}"
 USE_SWANLAB="${USE_SWANLAB:-1}"
-SWANLAB_PROJECT="${SWANLAB_PROJECT:-SpongeBob-Pretrain-Test2}"
+USE_COMPILE="${USE_COMPILE:-1}"
+SWANLAB_PROJECT="${SWANLAB_PROJECT:-GrandLine-Pretrain}"
 
 if [[ ! -f "$DATA_BIN" ]]; then
   echo "[error] data file not found: $DATA_BIN"
@@ -88,7 +90,7 @@ TRAIN_ARGS=(
   --data_path "$DATA_BIN"
   --save_dir "$SAVE_DIR"
   --epochs "$EPOCHS"
-  --global_batch_size "$GLOBAL_BATCH_SIZE"
+  --batch_size "$BATCH_SIZE"
   --learning_rate "$LEARNING_RATE"
   --log_interval "$LOG_INTERVAL"
   --save_interval "$SAVE_INTERVAL"
@@ -107,7 +109,7 @@ TRAIN_ARGS=(
   --from_weight none
   --from_resume 0
   --use_swanlab "$USE_SWANLAB"
-  --use_compile 0
+  --use_compile "$USE_COMPILE"
   --eval_bench "$EVAL_BENCH"
   --swanlab_project "$SWANLAB_PROJECT"
   --head_size "$HEAD_SIZE"
@@ -120,7 +122,8 @@ TRAIN_ARGS=(
 echo "[info] data_path=$DATA_BIN"
 echo "[info] save_dir=$SAVE_DIR"
 echo "[info] epochs=$EPOCHS"
-echo "[info] global_batch_size=$GLOBAL_BATCH_SIZE"
+echo "[info] batch_size_per_process=$BATCH_SIZE"
+echo "[info] use_compile=$USE_COMPILE"
 echo "[info] learning_rate=$LEARNING_RATE"
 echo "[info] log_interval=$LOG_INTERVAL"
 echo "[info] save_interval=$SAVE_INTERVAL"
