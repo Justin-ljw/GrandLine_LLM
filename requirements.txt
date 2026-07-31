@@ -1,5 +1,11 @@
 torch~=2.0.0
 transformers~=4.30.0
 datasets~=2.14.0
+numpy
+tqdm
+tokenizers~=0.13.0
 openai
 swanlab
+huggingface_hub
+modelscope
+python-dotenv
