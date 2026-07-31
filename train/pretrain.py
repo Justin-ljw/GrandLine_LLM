@@ -8,6 +8,9 @@ GrandLine 预训练脚本（支持多卡 DDP）
 主进程判断（保存/评测）、总步数按 world_size 分片、训练循环用 train_sampler、结束时 destroy_process_group。
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 import sys
 
 # 禁用 tokenizers 并行警告
@@ -186,7 +189,16 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=3000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
+    parser.add_argument('--num_attention_heads', default=12, type=int, help="注意力 Query 头数")
+    parser.add_argument('--num_key_value_heads', default=4, type=int, help="注意力 Key/Value 头数")
+    parser.add_argument('--head_size', default=64, type=int, help="每个注意力头的维度")
+    parser.add_argument('--intermediate_size', default=2048, type=int, help="FFN 中间层维度")
+    parser.add_argument('--vocab_size', default=15000, type=int, help="词表大小")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
+    parser.add_argument('--max_position_embeddings', default=32768, type=int, help="RoPE 最大位置长度")
+    parser.add_argument('--rope_theta', default=10000.0, type=float, help="RoPE 基础频率")
+    parser.add_argument('--hidden_act', default='silu', type=str, help="隐藏层激活函数")
+    parser.add_argument('--dropout', default=0.0, type=float, help="Dropout 比例")
     parser.add_argument("--data_path", type=str, default="", help="预处理后的.bin文件路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -196,8 +208,9 @@ if __name__ == "__main__":
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
     parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
     # Gated Attention
-    parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型")
+    parser.add_argument("--attn_gate_type", type=str, default="head", help="注意力门控类型")
     parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
+    parser.add_argument("--enable_gate_monitor", type=int, default=1, choices=[0, 1], help="是否启用注意力门控监控")
     
     args = parser.parse_args()
 
@@ -209,7 +222,7 @@ if __name__ == "__main__":
 
     # ========== 2. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
-    run_name = f"DDP_gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    run_name = f"DDP_gate_{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -234,7 +247,7 @@ if __name__ == "__main__":
     if args.use_swanlab == 1 and is_main_process():  # [DDP] 仅主进程上报；without_ddp 无 is_main_process()
         import swanlab
         # 传自己的 API Key
-        swanlab.login(api_key="")
+        swanlab.login(api_key=os.environ.get("SWANLAB_API_KEY", ""))
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
         swanlab_run = swanlab.init(
             project=args.swanlab_project,
@@ -247,9 +260,19 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     lm_config = GrandLineConfig(hidden_size=args.hidden_size,
-                                num_hidden_layers=args.num_hidden_layers, 
+                                num_hidden_layers=args.num_hidden_layers,
+                                num_attention_heads=args.num_attention_heads,
+                                num_key_value_heads=args.num_key_value_heads,
+                                head_size=args.head_size,
+                                intermediate_size=args.intermediate_size,
+                                vocab_size=args.vocab_size,
+                                max_position_embeddings=args.max_position_embeddings,
+                                rope_theta=args.rope_theta,
+                                hidden_act=args.hidden_act,
+                                dropout=args.dropout,
+                                enable_gate_monitor=args.enable_gate_monitor,
                                 # Gated Attention
-                                attn_gate_type=args.attn_gate_type, 
+                                attn_gate_type=args.attn_gate_type,
                                 attn_gate_init_bias=args.attn_gate_init_bias)
     
     # 创建或加载模型
@@ -267,7 +290,7 @@ if __name__ == "__main__":
         from transformers import AutoTokenizer
         # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
         # 传模型的 tokenizer 的路径
-        tokenizer = AutoTokenizer.from_pretrained('../tokenizer_15k')
+        tokenizer = AutoTokenizer.from_pretrained(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_15k"))
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None

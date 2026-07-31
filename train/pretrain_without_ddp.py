@@ -3,6 +3,9 @@
 用法: python pretrain_without_ddp.py [args]
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 import sys
 
 import torch.amp
@@ -166,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
     parser.add_argument("--eval_interval", type=int, default=1000, help="评测间隔步数")
     # Gated Attention
-    parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型")
+    parser.add_argument("--attn_gate_type", type=str, default="head", help="注意力门控类型")
     parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
     
     args = parser.parse_args()
@@ -174,7 +177,7 @@ if __name__ == "__main__":
     
     # ========== 1. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
-    run_name = f"gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    run_name = f"gate_{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -199,7 +202,7 @@ if __name__ == "__main__":
     if args.use_swanlab == 1:
         import swanlab
         # 传自己的 API Key
-        swanlab.login(api_key='')
+        swanlab.login(api_key=os.environ.get('SWANLAB_API_KEY', ''))
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
         swanlab_run = swanlab.init(
             project=args.swanlab_project,
@@ -232,7 +235,7 @@ if __name__ == "__main__":
         from transformers import AutoTokenizer
         # 评测时需要 tokenizer 来处理输入文本，但预训练阶段不直接使用（预训练数据已在 dataset 中处理）
         # 传模型的 tokenizer 的路径
-        tokenizer = AutoTokenizer.from_pretrained('../tokenizer_15k')
+        tokenizer = AutoTokenizer.from_pretrained(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_15k"))
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None

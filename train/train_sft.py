@@ -10,6 +10,9 @@ SFT 训练脚本：由 pretrain.py 复制后做少量修改得到，便于与预
 5. 新增参数：tokenizer_path, judge_api_key, judge_model
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 import sys
 
 # 禁用 tokenizers 并行警告
@@ -187,7 +190,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
     parser.add_argument("--eval_interval", type=int, default=1000, help="每隔多少 step 跑 mini_bench（0=关闭），用当前模型推理+DeepSeek Judge 打分")
     # [SFT] 新增：mini_bench 评测参数（使用 DeepSeek API）
-    parser.add_argument("--judge_api_key", type=str, default='', help="Judge API Key（可直接传入或从环境变量 DEEPSEEK_API_KEY 读取）")
+    parser.add_argument("--judge_api_key", type=str, default=os.environ.get('DEEPSEEK_API_KEY', ''), help="Judge API Key（可直接传入或从环境变量 DEEPSEEK_API_KEY 读取）")
     parser.add_argument("--judge_model", type=str, default="deepseek-chat", help="Judge 模型名")
     args = parser.parse_args()
 
@@ -224,7 +227,7 @@ if __name__ == "__main__":
     if args.use_swanlab == 1 and is_main_process():  # [DDP] 仅主进程上报；without_ddp 无 is_main_process()
         import swanlab
         # 传自己的 API Key
-        swanlab.login(api_key="")
+        swanlab.login(api_key=os.environ.get("SWANLAB_API_KEY", ""))
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
         swanlab_run = swanlab.init(
             project=args.swanlab_project,
