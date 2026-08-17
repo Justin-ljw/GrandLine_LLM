@@ -7,6 +7,9 @@ GRPO (Group Relative Policy Optimization) 训练脚本
 3. 格式正确 → DeepSeek Judge 评分 → reward=三指标均值
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 import sys
 import json
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -421,7 +424,7 @@ if __name__ == "__main__":
     # GRPO 参数
     parser.add_argument("--num_generations", type=int, default=4)
     parser.add_argument("--beta", type=float, default=0.05)
-    parser.add_argument("--judge_api_key", type=str, default='')
+    parser.add_argument("--judge_api_key", type=str, default=os.environ.get('DEEPSEEK_API_KEY', ''))
     parser.add_argument("--judge_model", type=str, default="deepseek-chat")
     
     # 控制
@@ -463,7 +466,7 @@ if __name__ == "__main__":
     swanlab_run = None
     if args.use_swanlab and is_main_process():
         import swanlab
-        swanlab.login(api_key="")
+        swanlab.login(api_key=os.environ.get("SWANLAB_API_KEY", ""))
         swanlab_run = swanlab.init(project=args.swanlab_project, experiment_name=run_name,
                                    id=ckp_data.get('swanlab_id') if ckp_data else None, config=vars(args))
         Logger(f'SwanLab: {run_name}')

@@ -310,37 +310,41 @@ python eval.py --model_path model_weight/dense/grpo_768.pth
 cd train\
 ```
 
-**1. DDP 分布式预训练 (Distributed Pre-training)**
+**1. 配置 API Key（不会提交到 Git）**
+
+创建并编辑 .env 文件，填写 SWANLAB_API_KEY 和 DEEPSEEK_API_KEY
+
+**2. DDP 分布式预训练 (Distributed Pre-training)**
 
 使用 `torchrun` 启动多卡并行预训练（以 4 卡为例）：
 ```bash
 torchrun --nproc_per_node=4 pretrain.py --data_path "YOUR_PRETRAIN_DATA_PATH" 
 ```
 
-**2. 单卡预训练 (Single-GPU Pre-training)** 
+**3. 单卡预训练 (Single-GPU Pre-training)** 
 
 针对资源受限或代码调试场景，可使用单卡基线版本：
 ```bash
 python pretrain_without_ddp.py --data_path "YOUR_PRETRAIN_DATA_PATH" 
 ```
 
-**3. 指令微调 (Supervised Fine-Tuning, SFT)**
+**4. 指令微调 (Supervised Fine-Tuning, SFT)**
 
-启动 SFT 训练须基于预训练模型的权重。请指定 --model_path，如需激活内置的大模型自动化评测管线，则需同传 --api_key：
+启动 SFT 训练须基于预训练模型的权重。请指定 --model_path，如需激活内置的大模型自动化评测管线，则需同传 --api_key. API Key 默认从项目根目录 `.env` 的 `DEEPSEEK_API_KEY` 读取，也可通过 `--judge_api_key` 临时覆盖：
 ```bash
 python train_sft.py --from_weight "model_weight/dense/pretrain_768.pth" --data_path "YOUR_SFT_DATA_PATH" --judge_api_key "YOUR_API_KEY" --judge_model "deepseek-chat"
 ```
 
-**4. 思维链蒸馏 (Chain-of-Thought Distillation)**
+**5. 思维链蒸馏 (Chain-of-Thought Distillation)**
 
 本阶段复用 SFT 的训练脚本。继承 SFT 阶段的模型权重，并注入由前沿大模型生成的详尽思维链数据（包含 <think> 标签），无需开启在线评测：
 ```bash
 python train_sft.py --from_weight "model_weight/dense/sft_768.pth" --data_path "YOUR_COT_DATA_PATH" --eval_bench 0
 ```
 
-**5. 强化学习对齐 (GRPO)**
+**6. 强化学习对齐 (GRPO)**
 
-启动 GRPO 训练需继承上一阶段（蒸馏或 SFT）的权重。由于本项目采用了 LLM-as-a-Judge 奖励模型，必须传入有效的前沿大模型 API Key（用于计算文本生成维度的评测奖励得分）：
+启动 GRPO 训练需继承上一阶段（蒸馏或 SFT）的权重。由于本项目采用了 LLM-as-a-Judge 奖励模型，必须传入有效的前沿大模型 API Key（用于计算文本生成维度的评测奖励得分）。项目会从 `.env` 的 `DEEPSEEK_API_KEY` 读取 Judge API Key，也可通过 `--judge_api_key` 临时覆盖：
 ```bash
 python train_grpo.py --sft_model_path "model_weight/dense/thinking_distill_768.pth" --data_path "YOUR_GRPO_DATA_PATH" --judge_api_key "YOUR_API_KEY" --judge_model "deepseek-chat"
 ```

@@ -6,6 +6,9 @@ mini_bench 评测：推理 + Judge（使用 DeepSeek API）
 环境变量：export DEEPSEEK_API_KEY="your-key-here"
 """
 import os, json, re, torch
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 from pathlib import Path
 
 _BENCH_JSONL = Path(__file__).parent / "100_mini_prompt.jsonl"
