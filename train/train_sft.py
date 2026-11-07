@@ -31,6 +31,9 @@ from transformers import AutoTokenizer  # [SFT] SFT 需一开始就加载 tokeni
 from dataset.sft_dataset import SFTDataset  # [SFT] pretrain 用 PretrainDataset(.bin)，SFT 用 SFTDataset(jsonl + 只算 assistant loss)
 from model.config import GrandLineConfig
 from model.model_grandline import GrandLineForCausalLM
+# [MoE兼容] 引入 MoE 架构的配置类与模型类
+from model.config_moe import GrandLineMoEConfig
+from model.model_grandline_moe import GrandLineMoEForCausalLM
 
 from utils import get_lr, Logger, is_main_process, init_distributed_mode, SkipBatchSampler  # [DDP] is_main_process/init_distributed_mode 仅 DDP 用；without_ddp 无
 from benchmark.mini_bench.eval import run_inference, run_judge_async  # [SFT] mini_bench 评测函数，推理 + Judge；pretrain 用 run_benchmark (C3/XCOPA)
@@ -72,6 +75,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         
         # 自动混合精度训练 搭配 梯度缩放防止下溢
         with autocast_ctx:
+            # [MoE兼容] dense 和 MoE 的 forward 都返回 CausalLMOutputWithPast，统一用 res.loss 取损失；
+            # MoE 的负载均衡损失 aux_loss 已在模型内部按 moe_aux_loss_coef 加权并进 loss，训练循环无需额外处理
             res = model(input_ids=input_ids, labels=labels)
             loss = res.loss / args.accumulation_steps
             
@@ -165,7 +170,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数（SFT 推荐 2-3 epoch，过多会过拟合）")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="初始学习率（SFT 推荐 1e-5 ~ 1e-4，从预训练继续可用 5e-5）")
-    parser.add_argument("--warmup_percent", type=float, default=0.1, help="warmup 占比（SFT 推荐更长 warmup，0.1 即 10%）")
+    parser.add_argument("--warmup_percent", type=float, default=0.1, help="warmup 占比（SFT 推荐更长 warmup，0.1 即 10%%）")  # %% 转义，否则 argparse 打印帮助时会报错
     parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减系数")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -176,6 +181,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
+    # [MoE兼容] 架构选择：dense=标准 FFN 架构，moe=混合专家架构
+    parser.add_argument("--architecture_type", type=str, default="dense", choices=["dense", "moe"], help="模型架构类型（dense=标准FFN，moe=混合专家）")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
     parser.add_argument("--data_path", type=str, default="", help="SFT 数据 jsonl 路径")
     parser.add_argument("--tokenizer_path", type=str, default="../tokenizer_15k", help="tokenizer 路径")  # [SFT] 新增：SFTDataset 需要 tokenizer
@@ -189,6 +196,9 @@ if __name__ == "__main__":
     # [SFT] 新增：mini_bench 评测参数（使用 DeepSeek API）
     parser.add_argument("--judge_api_key", type=str, default='', help="Judge API Key（可直接传入或从环境变量 DEEPSEEK_API_KEY 读取）")
     parser.add_argument("--judge_model", type=str, default="deepseek-chat", help="Judge 模型名")
+    # [GateAttn兼容] 与 pretrain.py / pretrain_without_ddp.py 保持一致的 Gated Attention 参数
+    parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型（none/token/head/channel）")
+    parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
     args = parser.parse_args()
 
 
@@ -199,7 +209,10 @@ if __name__ == "__main__":
 
     # ========== 2. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
-    run_name = f"h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    # [MoE兼容/GateAttn兼容] MoE 加 "moe_" 前缀，并带上 Gated Attention 配置：
+    # 保证 dense/MoE、不同 gate 配置的实验权重不会写进同一个目录
+    arch_prefix = "moe_" if args.architecture_type == "moe" else ""
+    run_name = f"{arch_prefix}gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -236,24 +249,48 @@ if __name__ == "__main__":
         Logger(f'SwanLab initialized: {run_name}')
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
-    
+    # [MoE兼容] 根据 --architecture_type 选择配置类和模型类，后续代码统一使用 model_cls / lm_config
+    if args.architecture_type == "moe":
+        # MoE 架构：专家相关超参（n_shared_experts / n_routed_experts / num_experts_per_tok /
+        # moe_intermediate_size / moe_aux_loss_coef）采用 GrandLineMoEConfig 的默认值
+        lm_config = GrandLineMoEConfig(hidden_size=args.hidden_size,
+                                       num_hidden_layers=args.num_hidden_layers,
+                                       # Gated Attention（MoE 与 dense 共用同一套门控实现）
+                                       attn_gate_type=args.attn_gate_type,
+                                       attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineMoEForCausalLM
+    else:
+        # dense 架构：与原逻辑一致，并补齐 Gated Attention 配置
+        lm_config = GrandLineConfig(hidden_size=args.hidden_size,
+                                    num_hidden_layers=args.num_hidden_layers,
+                                    # Gated Attention
+                                    attn_gate_type=args.attn_gate_type,
+                                    attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineForCausalLM
+
     # [SFT] 先加载 tokenizer（SFT 数据集需要，pretrain 仅在 eval_bench=1 时加载）
     Logger(f'Loading tokenizer from {args.tokenizer_path}')
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    
+
     # 创建或加载模型
     # [SFT] 用 load_state_dict 加载 .pth 权重文件，pretrain 用 from_pretrained 加载模型目录
+    # [MoE兼容] 由 model_cls 决定加载 dense / MoE 权重；注意 SFT 的 from_weight 必须与 --architecture_type 匹配
     if args.from_weight.lower() != 'none' and os.path.exists(args.from_weight):
         Logger(f'Loading model from {args.from_weight}')
-        model = GrandLineForCausalLM(lm_config)
+        model = model_cls(lm_config)
         model.load_state_dict(torch.load(args.from_weight, map_location='cpu'), strict=False)
     else:
-        Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
-        model = GrandLineForCausalLM(lm_config)
-        
+        Logger(f'Creating new {args.architecture_type} model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
+        model = model_cls(lm_config)
+
     model = model.to(args.device)
     Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+    # [MoE兼容] MoE 每个 token 只激活部分专家：打印专家配置和激活比例，便于理解实际计算量
+    if args.architecture_type == "moe":
+        Logger(f'[MoE] shared={lm_config.n_shared_experts}, routed={lm_config.n_routed_experts}, '
+               f'top_k={lm_config.num_experts_per_tok}, expert_hidden={lm_config.moe_intermediate_size} '
+               f'(每个 token 激活 {lm_config.n_shared_experts + lm_config.num_experts_per_tok}/'
+               f'{lm_config.n_shared_experts + lm_config.n_routed_experts} 个专家)')
     
     # 使用 torch.compile 加速模型前向和反向传播
     if args.use_compile == 1:

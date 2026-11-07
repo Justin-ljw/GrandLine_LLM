@@ -11,6 +11,7 @@ class GrandLineMoEConfig(PretrainedConfig):
         num_hidden_layers: Transformer-Decoder 层数
         num_attention_heads: 注意力Query头数
         num_key_value_heads: KV 头数（用于 Grouped Query Attention）
+        head_size: 每个头的维度，由 hidden_size // num_attention_heads 推导（默认 64）
         intermediate_size: FFN 中间层维度
         vocab_size: 词表大小
         num_experts: MoE专家数量
@@ -32,7 +33,9 @@ class GrandLineMoEConfig(PretrainedConfig):
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
         num_key_value_heads: int = 4,
-        
+        # head_size 不再独立配置：默认由 hidden_size // num_attention_heads 推导（默认 768 // 12 = 64，与原默认值一致）
+        head_size: int = None,
+
         # ===== 前馈网络 & MoE 配置 =====
         # 原 Dense 的 intermediate_size 是 2048。
         # 在 DeepSeekMoE 中，我们将专家体积缩小为原来的 1/4
@@ -62,6 +65,11 @@ class GrandLineMoEConfig(PretrainedConfig):
         
         # flash注意力机制
         flash_attn: bool = True,
+
+        # Gated Attention
+        attn_gate_type: str = 'none',
+        attn_gate_init_bias: float = 4.0,
+
         **kwargs):
             super().__init__(**kwargs)
             
@@ -69,7 +77,21 @@ class GrandLineMoEConfig(PretrainedConfig):
             self.num_hidden_layers = num_hidden_layers
             self.num_attention_heads = num_attention_heads
             self.num_key_value_heads = num_key_value_heads
-            
+            # head_size 必须等于 hidden_size // num_attention_heads：
+            # 先校验能整除，再推导 head_size；若显式传入的值与推导值不符则报错，避免后续 Gated Attention 维度错乱
+            if hidden_size % num_attention_heads != 0:
+                raise ValueError(
+                    f'hidden_size={hidden_size} 不能被 num_attention_heads={num_attention_heads} 整除，无法推导 head_size'
+                )
+            computed_head_size = hidden_size // num_attention_heads
+            if head_size is None:
+                head_size = computed_head_size
+            elif head_size != computed_head_size:
+                raise ValueError(
+                    f'head_size={head_size} 与推导值 hidden_size // num_attention_heads={computed_head_size} 不一致'
+                )
+            self.head_size = head_size
+
             self.moe_intermediate_size = moe_intermediate_size
             self.n_shared_experts = n_shared_experts
             self.n_routed_experts = n_routed_experts
@@ -85,6 +107,12 @@ class GrandLineMoEConfig(PretrainedConfig):
             self.bos_token_id = bos_token_id
             self.eos_token_id = eos_token_id
             self.flash_attn = flash_attn
+
+            # Gated Attention（校验规则与 GrandLineConfig 保持一致）
+            if attn_gate_type not in ("none", "token", "head", "channel"):
+                raise ValueError(f'Invalid attn_gate_type={attn_gate_type}')
+            self.attn_gate_type = attn_gate_type
+            self.attn_gate_init_bias = attn_gate_init_bias
 
     
     

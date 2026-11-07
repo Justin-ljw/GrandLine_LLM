@@ -7,6 +7,7 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, Tuple, List, Union
 from .config_moe import GrandLineMoEConfig
+from .attn_output_gate import AttnOutputGate
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int , eps: float = 1e-05):
@@ -131,7 +132,13 @@ class Attention(nn.Module):
         
         # Flash Attention 支持检测
         self.flash_attn = hasattr(nn.functional, 'scaled_dot_product_attention') and args.flash_attn
-        
+
+        # Gated Attention：与 dense 架构一致，在注意力输出上乘一个 sigmoid 门控
+        if getattr(args, 'attn_gate_type', 'none') != 'none':
+            self.attn_output_gate = AttnOutputGate(args)
+        else:
+            self.attn_output_gate = None
+
     def forward(
         self, 
         x: torch.Tensor, 
@@ -236,7 +243,11 @@ class Attention(nn.Module):
             attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
             attn_weights = self.attn_dropout(attn_weights)
             attn_output = torch.matmul(attn_weights, xv)  # (batch, num_attention_heads, q_len, head_dim)
-        
+
+        # Gated Attention：在多头合并前对注意力输出做门控（与 dense 架构一致）
+        if self.attn_output_gate is not None:
+            attn_output = attn_output * self.attn_output_gate(x)
+
         # 将多头合并回 (batch, seq_len, hidden_size)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         output = self.resid_dropout(self.Wo(attn_output))
@@ -338,7 +349,7 @@ class GrandLineMoE(nn.Module):
         return shared_output + routed_output, aux_loss
 
 
-class GrandLineBlock(nn.Module):
+class GrandLineMoEBlock(nn.Module):
     """
     Transformer-Decoder 块：Masked-Self-Attention + feed_forward(MoE)
     采用 Pre-Norm 结构（Norm before attention/mlp）
@@ -384,7 +395,7 @@ class GrandLineBlock(nn.Module):
         return x, presnet_key_value, aux_loss
 
 
-class GrandLineModel(nn.Module):
+class GrandLineMoEModel(nn.Module):
     """
     GrandLine 模型主体（Decoder-only Transformer）
     """
@@ -401,7 +412,7 @@ class GrandLineModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         
         # Transformer Decoder Blocks
-        self.layers = nn.ModuleList([GrandLineBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([GrandLineMoEBlock(l, config) for l in range(self.num_hidden_layers)])
         
         # 最终的 LayerNorm
         self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -467,10 +478,10 @@ class GrandLineModel(nn.Module):
         return hidden_states, present_key_values, total_aux_loss
     
 
-class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
+class GrandLineMoEForCausalLM(PreTrainedModel, GenerationMixin):
     """
-    包含语言模型头的 GrandLine 因果语言模型，用于文本生产任务
-    在 GrandLineModel 基础上添加 Language Modeling Head
+    包含语言模型头的 GrandLine MoE 因果语言模型，用于文本生产任务
+    在 GrandLineMoEModel 基础上添加 Language Modeling Head
     """
     config_class = GrandLineMoEConfig
     
@@ -479,7 +490,7 @@ class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
         super().__init__(self.config)
         
         # Transformer 主体
-        self.model = GrandLineModel(self.config)
+        self.model = GrandLineMoEModel(self.config)
         
         # language modeling head，与 token embedding 共享权重
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
@@ -554,8 +565,8 @@ class GrandLineForCausalLM(PreTrainedModel, GenerationMixin):
             )
             
             # 加入 MoE 的负载均衡 aux_loss
-            if hasattr(self.config, 'moe_aux_loss_coeff'):
-                loss += self.config.moe_aux_loss_coeff * aux_loss
+            if hasattr(self.config, 'moe_aux_loss_coef'):
+                loss += self.config.moe_aux_loss_coef * aux_loss
         
         # 把数据组织成类输出，包含 loss, logits, past_key_values, hidden_states
         output = CausalLMOutputWithPast(

@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-from config import GrandLineConfig
+from .config import GrandLineConfig
 
 class AttnOutputGate(nn.Module):
     def __init__(self, config: GrandLineConfig):

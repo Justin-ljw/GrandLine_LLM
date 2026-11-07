@@ -26,6 +26,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 from model.config import GrandLineConfig
 from model.model_grandline import GrandLineForCausalLM
+# [MoE兼容] 引入 MoE 架构的配置类与模型类
+from model.config_moe import GrandLineMoEConfig
+from model.model_grandline_moe import GrandLineMoEForCausalLM
 from dataset.grpo_dataset import GRPODataset
 from train.utils import Logger, is_main_process, init_distributed_mode, SkipBatchSampler
 
@@ -409,8 +412,13 @@ if __name__ == "__main__":
     # 模型配置
     parser.add_argument('--hidden_size', default=768, type=int)
     parser.add_argument('--num_hidden_layers', default=12, type=int)
+    # [MoE兼容] 架构选择：dense=标准 FFN 架构，moe=混合专家架构
+    parser.add_argument("--architecture_type", type=str, default="dense", choices=["dense", "moe"], help="模型架构类型（dense=标准FFN，moe=混合专家）")
     parser.add_argument('--max_seq_len', default=128, type=int)
     parser.add_argument("--max_gen_len", type=int, default=512)
+    # [GateAttn兼容] 与 pretrain.py / pretrain_without_ddp.py 保持一致的 Gated Attention 参数
+    parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型（none/token/head/channel）")
+    parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
     
     # 路径
     parser.add_argument("--data_path", type=str, default="")
@@ -438,9 +446,31 @@ if __name__ == "__main__":
         args.device = f"cuda:{local_rank}"
     
     # 配置
-    lm_config = GrandLineConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                                max_position_embeddings=args.max_seq_len + args.max_gen_len)
-    run_name = f"h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    # [MoE兼容] 根据 --architecture_type 选择配置类和模型类，policy 与 reference 模型共用同一套配置
+    if args.architecture_type == "moe":
+        # MoE 架构：专家相关超参（n_shared_experts / n_routed_experts / num_experts_per_tok /
+        # moe_intermediate_size / moe_aux_loss_coef）采用 GrandLineMoEConfig 的默认值
+        lm_config = GrandLineMoEConfig(hidden_size=args.hidden_size,
+                                       num_hidden_layers=args.num_hidden_layers,
+                                       max_position_embeddings=args.max_seq_len + args.max_gen_len,
+                                       # Gated Attention（MoE 与 dense 共用同一套门控实现）
+                                       attn_gate_type=args.attn_gate_type,
+                                       attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineMoEForCausalLM
+    else:
+        # dense 架构：与原逻辑一致，并补齐 Gated Attention 配置
+        lm_config = GrandLineConfig(hidden_size=args.hidden_size,
+                                    num_hidden_layers=args.num_hidden_layers,
+                                    max_position_embeddings=args.max_seq_len + args.max_gen_len,
+                                    # Gated Attention
+                                    attn_gate_type=args.attn_gate_type,
+                                    attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineForCausalLM
+
+    # [MoE兼容/GateAttn兼容] MoE 加 "moe_" 前缀，并带上 Gated Attention 配置：
+    # 保证 dense/MoE、不同 gate 配置的实验权重不会写进同一个目录
+    arch_prefix = "moe_" if args.architecture_type == "moe" else ""
+    run_name = f"{arch_prefix}gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -475,15 +505,22 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.unk_token if tokenizer.unk_token else '[PAD]'
     
     def load_model(trainable=True):
-        m = GrandLineForCausalLM(lm_config)
+        # [MoE兼容] 由 model_cls 决定构建 dense / MoE 模型；注意 sft_model_path 的权重架构需与 --architecture_type 匹配
+        m = model_cls(lm_config)
         if os.path.exists(args.sft_model_path):
             m.load_state_dict(torch.load(args.sft_model_path, map_location='cpu'), strict=False)
         m = m.to(args.device)
         return m if trainable else m.eval().requires_grad_(False)
-    
+
     model = load_model(trainable=True)
     ref_model = load_model(trainable=False)
     Logger(f'Model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params')
+    # [MoE兼容] MoE 每个 token 只激活部分专家：打印专家配置和激活比例，便于理解实际计算量
+    if args.architecture_type == "moe":
+        Logger(f'[MoE] shared={lm_config.n_shared_experts}, routed={lm_config.n_routed_experts}, '
+               f'top_k={lm_config.num_experts_per_tok}, expert_hidden={lm_config.moe_intermediate_size} '
+               f'(每个 token 激活 {lm_config.n_shared_experts + lm_config.num_experts_per_tok}/'
+               f'{lm_config.n_shared_experts + lm_config.n_routed_experts} 个专家)')
     
     if args.use_compile:
         model = torch.compile(model)

@@ -24,6 +24,9 @@ from torch.utils.data import DataLoader
 from dataset.pretrain_dataset import PretrainDataset
 from model.config import GrandLineConfig
 from model.model_grandline import GrandLineForCausalLM
+# [MoE兼容] 引入 MoE 架构的配置类与模型类
+from model.config_moe import GrandLineMoEConfig
+from model.model_grandline_moe import GrandLineMoEForCausalLM
 from utils import Logger, get_lr, SkipBatchSampler
 from benchmark.evaluator import run_benchmark
 
@@ -65,6 +68,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         
         # 自动混合精度训练 搭配 梯度缩放防止下溢
         with autocast_ctx:
+            # [MoE兼容] dense 和 MoE 的 forward 都返回 CausalLMOutputWithPast，统一用 res.loss 取损失；
+            # MoE 的负载均衡损失 aux_loss 已在模型内部按 moe_aux_loss_coef 加权并进 loss，训练循环无需额外处理
             res = model(input_ids=input_ids, labels=labels)
             loss = res.loss / args.accumulation_steps
             
@@ -145,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="初始学习率")
-    parser.add_argument("--warmup_percent", type=float, default=0.03, help="warmup 占比 3%")
+    parser.add_argument("--warmup_percent", type=float, default=0.03, help="warmup 占比 3%%")  # %% 转义，否则 argparse 打印帮助时会报 incomplete format
     parser.add_argument("--weight_decay", type=float, default=0.1, help="权重衰减系数")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -156,6 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=3000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
+    # [MoE兼容] 架构选择：dense=标准 FFN 架构，moe=混合专家架构
+    parser.add_argument("--architecture_type", type=str, default="dense", choices=["dense", "moe"], help="模型架构类型（dense=标准FFN，moe=混合专家）")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
     parser.add_argument("--data_path", type=str, default="", help="预处理后的.bin文件路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
@@ -174,7 +181,13 @@ if __name__ == "__main__":
     
     # ========== 1. 配置目录、检查 checkpoint ==========
     # 生成 run_name（用于后续创建子目录）
-    run_name = f"gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+
+    # [MoE兼容] 按架构生成不同的 run_name：MoE 加 "moe_" 前缀，保证 dense 与 MoE 的权重不会写进同一个目录；
+    # 两种架构都带上 Gated Attention 配置，不同 gate 配置的实验也不会互相覆盖。
+    if args.architecture_type == "moe":
+        run_name = f"moe_gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    else:
+        run_name = f"gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -211,21 +224,40 @@ if __name__ == "__main__":
         Logger(f'SwanLab initialized: {run_name}')
         
     # ========== 4. 模型、数据、优化器 ==========
-    lm_config = GrandLineConfig(hidden_size=args.hidden_size,
-                                num_hidden_layers=args.num_hidden_layers, 
-                                # Gated Attention
-                                attn_gate_type=args.attn_gate_type, 
-                                attn_gate_init_bias=args.attn_gate_init_bias)
-    
+    # [MoE兼容] 根据 --architecture_type 选择配置类和模型类，后续代码统一使用 model_cls / lm_config
+    if args.architecture_type == "moe":
+        # MoE 架构：专家相关超参（n_shared_experts / n_routed_experts / num_experts_per_tok /
+        # moe_intermediate_size / moe_aux_loss_coef）采用 GrandLineMoEConfig 的默认值
+        lm_config = GrandLineMoEConfig(hidden_size=args.hidden_size,
+                                       num_hidden_layers=args.num_hidden_layers,
+                                       # Gated Attention（MoE 与 dense 共用同一套门控实现）
+                                       attn_gate_type=args.attn_gate_type,
+                                       attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineMoEForCausalLM
+    else:
+        # dense 架构：与原逻辑完全一致（支持 Gated Attention）
+        lm_config = GrandLineConfig(hidden_size=args.hidden_size,
+                                    num_hidden_layers=args.num_hidden_layers,
+                                    # Gated Attention
+                                    attn_gate_type=args.attn_gate_type,
+                                    attn_gate_init_bias=args.attn_gate_init_bias)
+        model_cls = GrandLineForCausalLM
+
     # 创建或加载模型
     if args.from_weight.lower() != 'none' and os.path.exists(args.from_weight):
         Logger(f'Loading model from {args.from_weight}')
-        model = GrandLineForCausalLM.from_pretrained(args.from_weight)
+        model = model_cls.from_pretrained(args.from_weight)  # [MoE兼容] 由 model_cls 决定加载 dense / MoE 权重
     else:
-        Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
-        model = GrandLineForCausalLM(lm_config)
+        Logger(f'Creating new {args.architecture_type} model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
+        model = model_cls(lm_config)
     model = model.to(args.device)
     Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+    # [MoE兼容] MoE 每个 token 只激活部分专家：打印专家配置和激活比例，便于理解实际计算量
+    if args.architecture_type == "moe":
+        Logger(f'[MoE] shared={lm_config.n_shared_experts}, routed={lm_config.n_routed_experts}, '
+               f'top_k={lm_config.num_experts_per_tok}, expert_hidden={lm_config.moe_intermediate_size} '
+               f'(每个 token 激活 {lm_config.n_shared_experts + lm_config.num_experts_per_tok}/'
+               f'{lm_config.n_shared_experts + lm_config.n_routed_experts} 个专家)')
     
     # 创建 tokenizer 用于评测 benchmark
     if args.eval_bench == 1:
