@@ -151,7 +151,7 @@ python train/pretrain.py \
   --data_path data/pretrain_data/spongebob_pretrain_512.bin \
   --save_dir pretrain_out/verify_single \
   --epochs 1 \
-  --global_batch_size 8 \
+  --batch_size 8 \
   --head_size 64 \
   --learning_rate 1e-3 \
   --log_interval 1 \
@@ -162,7 +162,7 @@ python train/pretrain.py \
   --eval_bench 0
 ```
 
-为什么这里用 `global_batch_size=8`：实际验收时，`128` 在 87M 模型上可能直接触发 CUDA OOM；`8` 更适合作为“环境是否通”的默认值。
+为什么这里用 `batch_size=8`：`--batch_size` 是**每张卡**的 batch。实际验收时，`128` 在 87M 模型上可能直接触发 CUDA OOM；`8` 更适合作为“环境是否通”的默认值。
 
 ### 单卡成功标志
 
@@ -186,7 +186,7 @@ if count < 2:
 PY
 ```
 
-双卡也建议先用保守全局 batch size：
+双卡也建议先用保守的**每卡 batch size**：
 
 ```bash
 torchrun \
@@ -198,7 +198,7 @@ torchrun \
   --data_path data/pretrain_data/spongebob_pretrain_512.bin \
   --save_dir pretrain_out/verify_ddp2 \
   --epochs 1 \
-  --global_batch_size 8 \
+  --batch_size 4 \
   --head_size 64 \
   --learning_rate 1e-3 \
   --log_interval 1 \
@@ -209,7 +209,7 @@ torchrun \
   --eval_bench 0
 ```
 
-这里双卡时每张卡实际 batch size 是 `4`。  
+这里双卡时每张卡 batch size 是 `4`，全局 batch 为 `8`（`4 × 2`）。  
 环境验收阶段，目标是“能稳定启动并打印 step”，不是追求吞吐最大化。
 
 ### 双卡成功标志
@@ -238,6 +238,14 @@ NPROC_PER_NODE=1 bash scripts/run_pretrain_demo.sh
 
 ```bash
 HIDDEN_SIZE=768 NUM_ATTENTION_HEADS=12 HEAD_SIZE=64 bash scripts/run_pretrain_demo.sh
+```
+
+如果想切换到 MoE 架构（专家超参可单独覆盖）：
+
+```bash
+ARCHITECTURE_TYPE=moe bash scripts/run_pretrain_demo.sh
+ARCHITECTURE_TYPE=moe MOE_INTERMEDIATE_SIZE=256 N_ROUTED_EXPERTS=8 NUM_EXPERTS_PER_TOK=2 \
+  bash scripts/run_pretrain_demo.sh
 ```
 
 ## 10. 常见问题

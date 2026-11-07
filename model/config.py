@@ -28,6 +28,7 @@ class GrandLineConfig(PretrainedConfig):
         # Gated Attention
         attn_gate_type: gate attn的粒度，只能是("none", "token", "head", "channel")之一，其中"none"表示不使用gate
         attn_gate_init_bias: W_gate的初始偏置值（较大，用于抵消W全0初始化带来的训练波动，使得初始时gate影响很小）
+        enable_gate_monitor: 是否启用门控监控（当前仅作为配置项保留，监控逻辑尚未实现）
     """
     
     def __init__(
@@ -60,8 +61,9 @@ class GrandLineConfig(PretrainedConfig):
         
         # Gated Attention
         attn_gate_type: str = 'none',
-        attn_gate_init_bias: float = 4.0, 
-        
+        attn_gate_init_bias: float = 4.0,
+        enable_gate_monitor: bool = False,
+
         **kwargs):
             super().__init__(**kwargs)
             
@@ -99,6 +101,8 @@ class GrandLineConfig(PretrainedConfig):
                 raise ValueError(f'Invalid attn_gate_type={attn_gate_type}')
             self.attn_gate_type = attn_gate_type
             self.attn_gate_init_bias = attn_gate_init_bias
+            # 门控监控开关（目前仅作为配置项透传，监控逻辑尚未实现）
+            self.enable_gate_monitor = bool(enable_gate_monitor)
 
     
     

@@ -69,6 +69,7 @@ class GrandLineMoEConfig(PretrainedConfig):
         # Gated Attention
         attn_gate_type: str = 'none',
         attn_gate_init_bias: float = 4.0,
+        enable_gate_monitor: bool = False,
 
         **kwargs):
             super().__init__(**kwargs)
@@ -113,6 +114,8 @@ class GrandLineMoEConfig(PretrainedConfig):
                 raise ValueError(f'Invalid attn_gate_type={attn_gate_type}')
             self.attn_gate_type = attn_gate_type
             self.attn_gate_init_bias = attn_gate_init_bias
+            # 门控监控开关（目前仅作为配置项透传，监控逻辑尚未实现）
+            self.enable_gate_monitor = bool(enable_gate_monitor)
 
     
     

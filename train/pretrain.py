@@ -191,8 +191,23 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=3000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
+    parser.add_argument('--num_attention_heads', default=12, type=int, help="注意力 Query 头数")
+    parser.add_argument('--num_key_value_heads', default=4, type=int, help="注意力 Key/Value 头数")
+    parser.add_argument('--head_size', default=None, type=int, help="每个注意力头的维度；默认由 hidden_size // num_attention_heads 推导")
+    parser.add_argument('--intermediate_size', default=2048, type=int, help="FFN 中间层维度（dense 架构）")
+    parser.add_argument('--vocab_size', default=15000, type=int, help="词表大小")
+    parser.add_argument('--max_position_embeddings', default=32768, type=int, help="RoPE 最大位置长度")
+    parser.add_argument('--rope_theta', default=10000.0, type=float, help="RoPE 基础频率")
+    parser.add_argument('--hidden_act', default='silu', type=str, help="隐藏层激活函数")
+    parser.add_argument('--dropout', default=0.0, type=float, help="Dropout 比例")
     # [MoE兼容] 架构选择：dense=标准 FFN 架构，moe=混合专家架构
     parser.add_argument("--architecture_type", type=str, default="dense", choices=["dense", "moe"], help="模型架构类型（dense=标准FFN，moe=混合专家）")
+    # [MoE] 专家相关超参（仅 architecture_type=moe 时生效），默认值与 GrandLineMoEConfig 一致
+    parser.add_argument("--moe_intermediate_size", default=512, type=int, help="MoE 每个专家的 FFN 中间层维度")
+    parser.add_argument("--n_shared_experts", default=1, type=int, help="MoE 共享专家数量")
+    parser.add_argument("--n_routed_experts", default=15, type=int, help="MoE 路由专家数量")
+    parser.add_argument("--num_experts_per_tok", default=3, type=int, help="MoE 每个 token 激活的路由专家数（top-k）")
+    parser.add_argument("--moe_aux_loss_coef", default=0.01, type=float, help="MoE 负载均衡损失权重")
     parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
     parser.add_argument("--data_path", type=str, default="", help="预处理后的.bin文件路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
@@ -205,6 +220,7 @@ if __name__ == "__main__":
     # Gated Attention
     parser.add_argument("--attn_gate_type", type=str, default="none", help="注意力门控类型")
     parser.add_argument("--attn_gate_init_bias", type=float, default=4.0, help="注意力门控投影层bias初始值")
+    parser.add_argument("--enable_gate_monitor", default=0, type=int, choices=[0, 1], help="是否启用注意力门控监控（当前仅作为配置项保留）")
     
     args = parser.parse_args()
 
@@ -220,7 +236,15 @@ if __name__ == "__main__":
     # [MoE兼容] 按架构生成不同的 run_name：MoE 加 "moe_" 前缀，保证 dense 与 MoE 的权重不会写进同一个目录；
     # 两种架构都带上 Gated Attention 配置，不同 gate 配置的实验也不会互相覆盖。
     arch_prefix = "moe_" if args.architecture_type == "moe" else ""
-    run_name = f"DDP_{arch_prefix}gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    # 把影响模型结构的参数也写进目录名，避免不同 heads/FFN/vocab 的实验互相覆盖
+    arch_tag = f"_ah{args.num_attention_heads}_v{args.vocab_size}"
+    if args.architecture_type == "moe":
+        arch_tag += (f"_se{args.n_shared_experts}_re{args.n_routed_experts}"
+                     f"_epk{args.num_experts_per_tok}_ei{args.moe_intermediate_size}"
+                     f"_aux{args.moe_aux_loss_coef}")
+    else:
+        arch_tag += f"_i{args.intermediate_size}"
+    run_name = f"DDP_{arch_prefix}gt{args.attn_gate_type}_gb{args.attn_gate_init_bias}_h{args.hidden_size}_l{args.num_hidden_layers}{arch_tag}_bs{args.batch_size}_lr{args.learning_rate}"
     full_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(full_save_dir, exist_ok=True)
     
@@ -259,10 +283,25 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     # [MoE兼容] 根据 --architecture_type 选择配置类和模型类，后续代码统一使用 model_cls / lm_config
     if args.architecture_type == "moe":
-        # MoE 架构：专家相关超参（n_shared_experts / n_routed_experts / num_experts_per_tok /
-        # moe_intermediate_size / moe_aux_loss_coef）采用 GrandLineMoEConfig 的默认值
+        # MoE 架构：专家超参由命令行/环境变量控制，默认值与 GrandLineMoEConfig 一致
+        if args.intermediate_size != 2048:
+            Logger('[warn] --intermediate_size 对 MoE 架构不生效；请改用 --moe_intermediate_size')
         lm_config = GrandLineMoEConfig(hidden_size=args.hidden_size,
                                        num_hidden_layers=args.num_hidden_layers,
+                                       num_attention_heads=args.num_attention_heads,
+                                       num_key_value_heads=args.num_key_value_heads,
+                                       head_size=args.head_size,
+                                       moe_intermediate_size=args.moe_intermediate_size,
+                                       n_shared_experts=args.n_shared_experts,
+                                       n_routed_experts=args.n_routed_experts,
+                                       num_experts_per_tok=args.num_experts_per_tok,
+                                       moe_aux_loss_coef=args.moe_aux_loss_coef,
+                                       vocab_size=args.vocab_size,
+                                       max_position_embeddings=args.max_position_embeddings,
+                                       rope_theta=args.rope_theta,
+                                       hidden_act=args.hidden_act,
+                                       dropout=args.dropout,
+                                       enable_gate_monitor=args.enable_gate_monitor,
                                        # Gated Attention（MoE 与 dense 共用同一套门控实现）
                                        attn_gate_type=args.attn_gate_type,
                                        attn_gate_init_bias=args.attn_gate_init_bias)
@@ -271,6 +310,16 @@ if __name__ == "__main__":
         # dense 架构：与原逻辑完全一致（支持 Gated Attention）
         lm_config = GrandLineConfig(hidden_size=args.hidden_size,
                                     num_hidden_layers=args.num_hidden_layers,
+                                    num_attention_heads=args.num_attention_heads,
+                                    num_key_value_heads=args.num_key_value_heads,
+                                    head_size=args.head_size,
+                                    intermediate_size=args.intermediate_size,
+                                    vocab_size=args.vocab_size,
+                                    max_position_embeddings=args.max_position_embeddings,
+                                    rope_theta=args.rope_theta,
+                                    hidden_act=args.hidden_act,
+                                    dropout=args.dropout,
+                                    enable_gate_monitor=args.enable_gate_monitor,
                                     # Gated Attention
                                     attn_gate_type=args.attn_gate_type,
                                     attn_gate_init_bias=args.attn_gate_init_bias)
